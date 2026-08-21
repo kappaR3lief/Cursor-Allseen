@@ -1,0 +1,340 @@
+<!--
+  ALLSEEN. — 3D glass cursor
+
+  Works in BOTH places:
+    A) Site Settings → Custom Code → End of <body> tag   ← best
+    B) An Embed element (Insert → Embed → HTML)          ← also works now
+
+  In case B the script detects it is inside Framer's iframe and mounts the
+  cursor into the parent page instead, so it still covers the whole site.
+  If Framer sandboxes the iframe it will say so in the console and tell you
+  to switch to A. Set the Embed to roughly 1×1 px — it's only a host.
+
+  MODEL_URL is already set to your repo:
+    github.com/kappaR3lief/Cursor-Allseen → glass-cursor-lite.glb
+
+  That repo must be PUBLIC. If there's still a padlock next to the repo name,
+  nothing will load: Settings → Danger Zone → Change visibility → Public.
+
+  Open the browser console — every step logs under [glass cursor].
+-->
+
+<script type="module">
+(async function glassCursor() {
+  const TAG = "[glass cursor]"
+
+  // ---------------------------------------------------------------------------
+  // CONFIG
+  // ---------------------------------------------------------------------------
+  const CONFIG = {
+    // Your model, served from GitHub via jsDelivr. The repo must be public.
+    MODEL_URL: "https://cdn.jsdelivr.net/gh/kappaR3lief/Cursor-Allseen@main/glass-cursor-lite.glb",
+    // Fallback if jsDelivr 404s on a freshly-made repo — swap the line above for:
+    // MODEL_URL: "https://raw.githubusercontent.com/kappaR3lief/Cursor-Allseen/main/glass-cursor-lite.glb",
+
+    SIZE: 140,            // px, the cursor canvas
+    FILL: 1,              // how much of that canvas the model occupies
+    ROT_X: -90,           // your model exports lying flat; this stands it up
+    ROT_Y: 0,
+    ROT_Z: 0,
+
+    MATERIAL: "glass",    // "glass" | "metal" | "original"
+    TINT: 0xffffff,
+    ROUGHNESS: 0.08,
+    METALNESS: 0,
+    TRANSMISSION: 1,
+    IOR: 1.5,
+    THICKNESS: 0.6,
+    ENV_INTENSITY: 1.4,
+
+    FOLLOW: 0.6,          // 1 = locked to pointer, lower = lags behind
+    TILT: 1,
+    IDLE_SPIN: 0.25,
+    HIDE_SYSTEM_CURSOR: true,
+
+    DEBUG: true,          // set false once it's working
+  }
+
+  const log = (...a) => CONFIG.DEBUG && console.log(TAG, ...a)
+  const warn = (...a) => console.warn(TAG, ...a)
+
+  if (!CONFIG.MODEL_URL || CONFIG.MODEL_URL.includes("REPLACE_ME")) {
+    warn("MODEL_URL is not set. Open this snippet and paste your .glb URL into CONFIG.MODEL_URL.")
+    return
+  }
+
+  // ---------------------------------------------------------------------------
+  // Work out which document to mount into.
+  //
+  // Framer's Embed element renders inside an iframe. An iframe cannot be a
+  // site-wide cursor on its own — but Framer's HTML embeds are same-origin, so
+  // we can reach out and mount into the real page. If the iframe is sandboxed
+  // this throws, and Custom Code is the only route.
+  // ---------------------------------------------------------------------------
+  let doc = document
+  let win = window
+  let escaped = false
+  if (window.self !== window.top) {
+    try {
+      if (window.top.document && window.top.document.body) {
+        doc = window.top.document
+        win = window.top
+        escaped = true
+      }
+    } catch (e) {
+      warn(
+        "Running inside a sandboxed iframe — the cursor would only work inside " +
+        "this box. Move this snippet to Site Settings → Custom Code → End of <body>."
+      )
+      return
+    }
+  }
+  log(escaped ? "in an Embed, mounted to the parent page" : "mounted to the page")
+
+  if (escaped) {
+    // The Embed element itself is just a host — make it invisible and inert.
+    document.documentElement.style.background = "transparent"
+    document.body.style.background = "transparent"
+    document.body.style.pointerEvents = "none"
+    try {
+      const me = [...doc.querySelectorAll("iframe")].find((f) => f.contentWindow === window)
+      if (me) {
+        me.style.pointerEvents = "none"
+        me.style.opacity = "0"
+      }
+    } catch (e) { /* not fatal */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Guards — cases where a custom cursor is the wrong answer.
+  // ---------------------------------------------------------------------------
+  const mm = (q) => win.matchMedia(q).matches
+  if (mm("(forced-colors: active)")) return log("high contrast — leaving the system cursor")
+  if (mm("(hover: none)") || mm("(pointer: coarse)")) return log("touch — no cursor to replace")
+  if (doc.getElementById("gc-cursor")) return log("already running")
+
+  // ---------------------------------------------------------------------------
+  // Styles, injected into whichever document we ended up in.
+  // ---------------------------------------------------------------------------
+  const style = doc.createElement("style")
+  style.textContent = `
+    html.gc-on, html.gc-on * { cursor: none !important; }
+    html.gc-on input, html.gc-on textarea, html.gc-on select,
+    html.gc-on [contenteditable="true"] { cursor: auto !important; }
+    #gc-cursor { position: fixed; top: 0; left: 0; pointer-events: none;
+      opacity: 0; transition: opacity .18s ease; will-change: transform;
+      z-index: 2147483000; }
+    @media (forced-colors: active) {
+      #gc-cursor { display: none !important; }
+      html.gc-on, html.gc-on * { cursor: auto !important; }
+    }`
+  doc.head.appendChild(style)
+
+  // ---------------------------------------------------------------------------
+  // three
+  // ---------------------------------------------------------------------------
+  let THREE, GLTFLoader
+  try {
+    THREE = await import("https://esm.sh/three@0.160.1")
+    ;({ GLTFLoader } = await import(
+      "https://esm.sh/three@0.160.1/examples/jsm/loaders/GLTFLoader.js"
+    ))
+    log("three loaded", THREE.REVISION)
+  } catch (e) {
+    warn("could not load three from esm.sh — check for a Content-Security-Policy blocking it", e)
+    return
+  }
+
+  const reduceMQ = win.matchMedia("(prefers-reduced-motion: reduce)")
+  let reduced = reduceMQ.matches
+  reduceMQ.addEventListener("change", (e) => { reduced = e.matches })
+
+  let renderer
+  try {
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: "low-power" })
+  } catch (e) {
+    warn("no WebGL — keeping the system cursor")
+    return
+  }
+
+  const holder = doc.createElement("div")
+  holder.id = "gc-cursor"
+  holder.setAttribute("aria-hidden", "true")
+  holder.style.width = CONFIG.SIZE + "px"
+  holder.style.height = CONFIG.SIZE + "px"
+  doc.body.appendChild(holder)
+
+  renderer.setPixelRatio(Math.min(win.devicePixelRatio || 1, 2))
+  renderer.setSize(CONFIG.SIZE, CONFIG.SIZE, false)
+  renderer.setClearColor(0x000000, 0)
+  renderer.outputColorSpace = THREE.SRGBColorSpace
+  renderer.toneMapping = THREE.ACESFilmicToneMapping
+  renderer.toneMappingExposure = 1.1
+
+  const canvas = renderer.domElement
+  canvas.style.width = CONFIG.SIZE + "px"
+  canvas.style.height = CONFIG.SIZE + "px"
+  canvas.style.display = "block"
+  holder.appendChild(canvas)
+
+  const scene = new THREE.Scene()
+  const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100)
+  camera.position.set(0, 0, 3.2)
+
+  // ---------------------------------------------------------------------------
+  // Studio environment — glass needs something to refract or it renders grey.
+  // ---------------------------------------------------------------------------
+  function studioEnvironment() {
+    const s = new THREE.Scene()
+    const box = new THREE.BoxGeometry()
+    box.deleteAttribute("uv")
+    const owned = [box]
+
+    const shell = new THREE.MeshBasicMaterial({ color: 0x2a2a30, side: THREE.BackSide })
+    const room = new THREE.Mesh(box, shell)
+    room.scale.setScalar(12)
+    s.add(room)
+    owned.push(shell)
+
+    const panel = (color, intensity, scale, pos) => {
+      const m = new THREE.MeshBasicMaterial({ color })
+      m.color.multiplyScalar(intensity)
+      const mesh = new THREE.Mesh(box, m)
+      mesh.scale.set(...scale)
+      mesh.position.set(...pos)
+      s.add(mesh)
+      owned.push(m)
+    }
+    panel(0xffffff, 6.0, [7, 0.4, 7], [0, 5.4, 0])
+    panel(0xfff0e0, 2.4, [0.4, 5, 5], [-5.4, 0.5, 0])
+    panel(0xdce8ff, 2.0, [0.4, 5, 5], [5.4, 0.5, 0])
+    panel(0xffffff, 1.6, [5, 5, 0.4], [0, 0.5, -5.4])
+
+    return { scene: s, dispose: () => owned.forEach((o) => o.dispose()) }
+  }
+
+  const pmrem = new THREE.PMREMGenerator(renderer)
+  const studio = studioEnvironment()
+  scene.environment = pmrem.fromScene(studio.scene, 0.04).texture
+  studio.dispose()
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 0.6))
+  const key = new THREE.DirectionalLight(0xffffff, 2.2)
+  key.position.set(2, 3, 4)
+  scene.add(key)
+
+  // ---------------------------------------------------------------------------
+  // Model
+  // ---------------------------------------------------------------------------
+  const pivot = new THREE.Group()
+  scene.add(pivot)
+  let ready = false
+
+  log("loading model", CONFIG.MODEL_URL)
+  new GLTFLoader().load(
+    CONFIG.MODEL_URL,
+    (gltf) => {
+      const model = gltf.scene
+      const bbox = new THREE.Box3().setFromObject(model)
+      const centre = bbox.getCenter(new THREE.Vector3())
+      const size = bbox.getSize(new THREE.Vector3())
+      const longest = Math.max(size.x, size.y, size.z) || 1
+      model.position.sub(centre)
+
+      const fit = new THREE.Group()
+      fit.add(model)
+      fit.scale.setScalar((1 / longest) * CONFIG.FILL)
+      pivot.add(fit)
+
+      if (CONFIG.MATERIAL !== "original") {
+        model.traverse((o) => {
+          if (!o.isMesh) return
+          const old = o.material
+          const next = new THREE.MeshPhysicalMaterial({
+            map: old?.map ?? null,
+            normalMap: old?.normalMap ?? null,
+            color: new THREE.Color(CONFIG.TINT),
+            roughness: CONFIG.ROUGHNESS,
+            metalness: CONFIG.MATERIAL === "metal" ? 1 : CONFIG.METALNESS,
+            envMapIntensity: CONFIG.ENV_INTENSITY,
+          })
+          if (CONFIG.MATERIAL === "glass") {
+            next.transmission = CONFIG.TRANSMISSION
+            next.ior = CONFIG.IOR
+            next.thickness = CONFIG.THICKNESS
+            next.transparent = true
+            next.depthWrite = false
+          }
+          o.material = next
+          old?.dispose?.()
+        })
+      }
+
+      ready = true
+      holder.style.opacity = "1"
+      if (CONFIG.HIDE_SYSTEM_CURSOR) doc.documentElement.classList.add("gc-on")
+      log("model ready — bbox", size.toArray().map((v) => v.toFixed(2)).join(" x "))
+    },
+    undefined,
+    (err) => {
+      warn(
+        "could not load the model. Check the URL is public https and CORS-enabled, " +
+        "and that the .glb needs no Draco/meshopt decoder (use glass-cursor-lite.glb).",
+        CONFIG.MODEL_URL, err
+      )
+      doc.documentElement.classList.remove("gc-on")
+      holder.remove()
+    }
+  )
+
+  // ---------------------------------------------------------------------------
+  // Pointer + loop. Events come from the host document, not this iframe.
+  // ---------------------------------------------------------------------------
+  let x = win.innerWidth / 2, y = win.innerHeight / 2
+  let cx = x, cy = y, tiltX = 0, tiltZ = 0, t = 0
+  let last = performance.now()
+  const D = THREE.MathUtils.degToRad
+
+  win.addEventListener("pointermove", (e) => { x = e.clientX; y = e.clientY }, { passive: true })
+  doc.addEventListener("pointerleave", () => { holder.style.opacity = "0" })
+  doc.addEventListener("pointerenter", () => { if (ready) holder.style.opacity = "1" })
+  doc.addEventListener("visibilitychange", () => {
+    holder.style.opacity = doc.hidden ? "0" : ready ? "1" : "0"
+  })
+
+  function tick(now) {
+    win.requestAnimationFrame(tick)
+    const dt = Math.min((now - last) / 1000, 0.05)
+    last = now
+    if (!ready) return
+
+    if (reduced) {
+      // Reduced motion: exact 1:1 tracking. No lag, no tilt, no spin.
+      cx = x; cy = y
+      pivot.rotation.set(D(CONFIG.ROT_X), D(CONFIG.ROT_Y), D(CONFIG.ROT_Z))
+    } else {
+      const k = 1 - Math.pow(1 - Math.min(0.99, CONFIG.FOLLOW), dt * 60)
+      const nx = cx + (x - cx) * k
+      const ny = cy + (y - cy) * k
+      const vx = (nx - cx) / (dt || 0.016)
+      const vy = (ny - cy) / (dt || 0.016)
+      cx = nx; cy = ny
+      t += dt
+
+      const clamp = (v) => Math.max(-0.6, Math.min(0.6, v))
+      tiltZ += (clamp(-vx * 0.0016 * CONFIG.TILT) - tiltZ) * Math.min(1, dt * 8)
+      tiltX += (clamp(vy * 0.0016 * CONFIG.TILT) - tiltX) * Math.min(1, dt * 8)
+
+      pivot.rotation.set(
+        D(CONFIG.ROT_X) + tiltX,
+        D(CONFIG.ROT_Y) + t * CONFIG.IDLE_SPIN,
+        D(CONFIG.ROT_Z) + tiltZ
+      )
+    }
+
+    holder.style.transform = `translate3d(${cx}px, ${cy}px, 0) translate(-50%, -50%)`
+    renderer.render(scene, camera)
+  }
+  win.requestAnimationFrame(tick)
+})()
+</script>
